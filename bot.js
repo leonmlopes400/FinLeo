@@ -4,6 +4,9 @@ const fs = require('fs');
 const OpenAI = require('openai');
 const { google } = require('googleapis');
 
+// ===== CHROMIUM (CORREÇÃO RAILWAY) =====
+const chromium = require('@sparticuz/chromium');
+
 // ===== CONFIG =====
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -17,117 +20,173 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: 'v4', auth });
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
-// ===== WHATSAPP =====
-const client = new Client({
-  puppeteer: {
-    args: ['--no-sandbox']
+// ===== INICIAR TUDO EM FUNÇÃO ASYNC =====
+(async () => {
+
+  // ===== WHATSAPP CLIENT =====
+  const client = new Client({
+    puppeteer: {
+      executablePath: await chromium.executablePath(),
+      args: chromium.args,
+      headless: true
+    }
+  });
+
+  client.on('qr', qr => {
+    qrcode.generate(qr, { small: true });
+  });
+
+  client.on('ready', () => {
+    console.log('✅ Bot conectado!');
+  });
+
+  // ===== GOOGLE SHEETS =====
+  async function salvarGasto(valor, categoria, descricao) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'A:E',
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          new Date().toLocaleString(),
+          'gasto',
+          valor,
+          categoria,
+          descricao
+        ]]
+      }
+    });
   }
-});
 
-client.on('qr', qr => {
-  qrcode.generate(qr, { small: true });
-});
+  async function calcularSaldo() {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'A:E'
+    });
 
-client.on('ready', () => {
-  console.log('✅ Bot conectado!');
-});
+    const rows = res.data.values || [];
+    let saldo = 0;
 
-// ===== GOOGLE SHEETS =====
-async function salvarGasto(valor, categoria, descricao) {
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: 'A:E',
-    valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [[
-        new Date().toLocaleString(),
-        'gasto',
-        valor,
-        categoria,
-        descricao
-      ]]
+    rows.slice(1).forEach(linha => {
+      const tipo = linha[1];
+      const valor = parseFloat(linha[2]);
+
+      if (tipo === 'gasto') saldo -= valor;
+      if (tipo === 'receita') saldo += valor;
+    });
+
+    return saldo;
+  }
+
+  async function resumoMensal() {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'A:E'
+    });
+
+    const rows = res.data.values || [];
+    const hoje = new Date();
+    const mesAtual = hoje.getMonth();
+    const anoAtual = hoje.getFullYear();
+
+    let total = 0;
+    const categorias = {};
+
+    rows.slice(1).forEach(linha => {
+      const data = new Date(linha[0]);
+      const tipo = linha[1];
+      const valor = parseFloat(linha[2]);
+      const categoria = linha[3];
+
+      if (
+        data.getMonth() === mesAtual &&
+        data.getFullYear() === anoAtual &&
+        tipo === 'gasto'
+      ) {
+        total += valor;
+
+        if (!categorias[categoria]) {
+          categorias[categoria] = 0;
+        }
+
+        categorias[categoria] += valor;
+      }
+    });
+
+    let texto = `📊 Resumo do mês:\n\n💰 Total: R$ ${total}\n\n`;
+
+    for (let cat in categorias) {
+      texto += `• ${cat}: R$ ${categorias[cat]}\n`;
     }
-  });
-}
 
-async function calcularSaldo() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range: 'A:E'
-  });
+    return texto;
+  }
 
-  const rows = res.data.values || [];
-  let saldo = 0;
+  // ===== PROCESSAMENTO =====
+  async function processarTexto(texto, msg) {
+    texto = texto.toLowerCase();
 
-  rows.slice(1).forEach(linha => {
-    const tipo = linha[1];
-    const valor = parseFloat(linha[2]);
+    if (texto.includes('gastei')) {
+      const valor = texto.match(/\d+/)?.[0];
 
-    if (tipo === 'gasto') saldo -= valor;
-    if (tipo === 'receita') saldo += valor;
-  });
+      if (!valor) {
+        msg.reply('❌ Não entendi o valor');
+        return;
+      }
 
-  return saldo;
-}
+      let categoria = texto.split('gastei')[1];
+      categoria = categoria.replace(valor, '').trim();
 
-// ===== PROCESSAMENTO =====
-async function processarTexto(texto, msg) {
-  texto = texto.toLowerCase();
+      await salvarGasto(valor, categoria, texto);
+      const saldo = await calcularSaldo();
 
-  if (texto.includes('gastei')) {
-    const valor = texto.match(/\d+/)?.[0];
-
-    if (!valor) {
-      msg.reply('❌ Não entendi o valor');
-      return;
-    }
-
-    let categoria = texto.split('gastei')[1];
-    categoria = categoria.replace(valor, '').trim();
-
-    await salvarGasto(valor, categoria, texto);
-    const saldo = await calcularSaldo();
-
-    msg.reply(`✅ Registrado!
+      msg.reply(`✅ Registrado!
 R$${valor} em ${categoria}
 💰 Saldo: R$${saldo}`);
-  }
+    }
 
-  if (texto.includes('saldo')) {
-    const saldo = await calcularSaldo();
-    msg.reply(`💰 Saldo atual: R$${saldo}`);
-  }
-}
+    if (texto.includes('saldo')) {
+      const saldo = await calcularSaldo();
+      msg.reply(`💰 Saldo atual: R$${saldo}`);
+    }
 
-// ===== MENSAGENS =====
-client.on('message', async msg => {
-
-  // TEXTO
-  if (!msg.hasMedia) {
-    processarTexto(msg.body, msg);
-  }
-
-  // ÁUDIO
-  if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio')) {
-    const media = await msg.downloadMedia();
-    fs.writeFileSync('audio.ogg', media.data, 'base64');
-
-    try {
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream("audio.ogg"),
-        model: "gpt-4o-mini-transcribe"
-      });
-
-      const texto = transcription.text;
-
-      msg.reply(`🎤 Entendi: "${texto}"`);
-      processarTexto(texto, msg);
-
-    } catch (err) {
-      msg.reply('❌ Erro ao processar áudio');
-      console.error(err);
+    if (texto.includes('resumo')) {
+      const resumo = await resumoMensal();
+      msg.reply(resumo);
     }
   }
-});
 
-client.initialize();
+  // ===== RECEBER MENSAGENS =====
+  client.on('message', async msg => {
+
+    // TEXTO
+    if (!msg.hasMedia) {
+      processarTexto(msg.body, msg);
+    }
+
+    // ÁUDIO
+    if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio')) {
+      const media = await msg.downloadMedia();
+      fs.writeFileSync('audio.ogg', media.data, 'base64');
+
+      try {
+        const transcription = await openai.audio.transcriptions.create({
+          file: fs.createReadStream("audio.ogg"),
+          model: "gpt-4o-mini-transcribe"
+        });
+
+        const texto = transcription.text;
+
+        msg.reply(`🎤 Entendi: "${texto}"`);
+        processarTexto(texto, msg);
+
+      } catch (err) {
+        msg.reply('❌ Erro ao processar áudio');
+        console.error(err);
+      }
+    }
+  });
+
+  client.initialize();
+
+})();
