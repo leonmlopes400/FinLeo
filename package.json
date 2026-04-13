@@ -1,5 +1,5 @@
 {
-  "name": "bot-financeiro-whatsapp",
+  "name": "bot-financeiro",
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
@@ -9,6 +9,8 @@
     "whatsapp-web.js": "^1.23.0",
     "qrcode-terminal": "^0.12.0",
     "openai": "^4.0.0",
-    "googleapis": "^133.0.0"
+    "googleapis": "^133.0.0",
+    "puppeteer-core": "^21.0.0",
+    "@sparticuz/chromium": "^119.0.0"
   }
 }
