@@ -20,7 +20,7 @@
     table{width:100%;border-collapse:collapse}
     th,td{padding:10px 8px;border-bottom:1px solid #263055}
     th{color:#9fb0e6}
-    .meta-row{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;margin-bottom:8px}
+    .meta-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;margin-bottom:12px}
     .progress{height:10px;background:#0b1020;border-radius:999px;overflow:hidden;border:1px solid #263055}
     .bar{height:100%;background:#7aa2ff}
     @media (max-width:900px){.grid,.two{grid-template-columns:1fr}}
@@ -47,7 +47,7 @@
       <div class="card"><div class="title">Saldo do período</div><div class="value" id="saldoAtual">-</div></div>
       <div class="card"><div class="title">Gastos do período</div><div class="value" id="gastoMes">-</div></div>
       <div class="card"><div class="title">Receitas do período</div><div class="value" id="receitaMes">-</div></div>
-      <div class="card"><div class="title">Saldo total</div><div class="value" id="saldoTotal">-</div></div>
+      <div class="card"><div class="title">Saldo do período</div><div class="value" id="saldoMes">-</div></div>
     </div>
 
     <div class="section two">
@@ -90,7 +90,8 @@ function currentMonthValue() {
 }
 
 async function loadCategories() {
-  const res = await fetch('/api?month=' + encodeURIComponent(document.getElementById('monthFilter').value || currentMonthValue()));
+  const month = document.getElementById('monthFilter').value || currentMonthValue();
+  const res = await fetch('/api?month=' + encodeURIComponent(month));
   const data = await res.json();
   const sel = document.getElementById('categoryFilter');
   const prev = sel.value;
@@ -111,10 +112,7 @@ async function load() {
   document.getElementById('saldoAtual').textContent = money(data.saldo || 0);
   document.getElementById('gastoMes').textContent = money(data.gasto || 0);
   document.getElementById('receitaMes').textContent = money(data.receita || 0);
-
-  const totalRes = await fetch('/api?month=' + encodeURIComponent(currentMonthValue()));
-  const totalData = await totalRes.json();
-  document.getElementById('saldoTotal').textContent = money(totalData.saldo || 0);
+  document.getElementById('saldoMes').textContent = money((data.receita || 0) - (data.gasto || 0));
 
   const latestBody = document.getElementById('latestBody');
   latestBody.innerHTML = '';
@@ -174,18 +172,21 @@ async function load() {
         <div class="progress"><div class="bar" style="width:${pct}%"></div></div>
       </div>
       <div>${(meta.percentual || 0) >= 100 ? '🚨' : (meta.percentual || 0) >= 80 ? '⚠️' : '✅'}</div>
-      <div></div>
     `;
     metasBox.appendChild(div);
   });
 }
 
 document.getElementById('monthFilter').value = currentMonthValue();
-document.getElementById('applyBtn').onclick = () => load();
-document.getElementById('clearBtn').onclick = () => {
+document.getElementById('applyBtn').onclick = async () => {
+  await loadCategories();
+  await load();
+};
+document.getElementById('clearBtn').onclick = async () => {
   document.getElementById('monthFilter').value = currentMonthValue();
   document.getElementById('categoryFilter').value = '';
-  load();
+  await loadCategories();
+  await load();
 };
 
 loadCategories().then(load);

@@ -22,8 +22,8 @@ const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
-
 const sheets = google.sheets({ version: 'v4', auth });
+
 const LANCAMENTOS_SHEET = 'Lancamentos';
 const METAS_SHEET = 'Metas';
 
@@ -39,6 +39,9 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
 });
 
 const pendingDelete = new Map();
+let lancamentosCache = { data: null, ts: 0 };
+let metasCache = { data: null, ts: 0 };
+const CACHE_MS = 60000;
 
 bot.on('polling_error', async (error) => {
   console.error('Polling error:', error?.message || error);
@@ -91,14 +94,15 @@ function parseMonthRef(text) {
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
   }
 
-  const anoMatch = t.match(/20\d{2}/);
-  const year = anoMatch ? Number(anoMatch[0]) : now.getUTCFullYear();
+  const yearMatch = t.match(/20\d{2}/);
+  const year = yearMatch ? Number(yearMatch[0]) : now.getUTCFullYear();
 
   for (const [name, idx] of Object.entries(months)) {
     if (t.includes(name)) {
       return new Date(Date.UTC(year, idx, 1));
     }
   }
+
   return now;
 }
 
@@ -123,17 +127,25 @@ async function ensureSheet(sheetName, header) {
   }).catch(() => ({ data: { values: [] } }));
 
   const values = res.data.values || [];
-  if (!values.length || values[0].join('|') !== header.join('|')) {
+  const currentHeader = values[0] || [];
+
+  if (header.join('|') !== currentHeader.join('|')) {
+    const endCol = String.fromCharCode(64 + header.length);
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `${sheetName}!A1:${String.fromCharCode(64 + header.length)}1`,
+      range: `${sheetName}!A1:${endCol}1`,
       valueInputOption: 'RAW',
       requestBody: { values: [header] }
     });
   }
 }
 
-async function getRows(sheetName, range) {
+async function bootstrapSheets() {
+  await ensureSheet(LANCAMENTOS_SHEET, ['ID', 'Data', 'Tipo', 'Valor', 'Categoria', 'Descrição', 'Usuário']);
+  await ensureSheet(METAS_SHEET, ['Categoria', 'Valor']);
+}
+
+async function getSheetValues(range) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range
@@ -141,18 +153,13 @@ async function getRows(sheetName, range) {
   return res.data.values || [];
 }
 
-async function ensureLancamentosSheet() {
-  await ensureSheet(LANCAMENTOS_SHEET, ['ID', 'Data', 'Tipo', 'Valor', 'Categoria', 'Descrição', 'Usuário']);
-}
+async function getLancamentos(force = false) {
+  if (!force && lancamentosCache.data && Date.now() - lancamentosCache.ts < CACHE_MS) {
+    return lancamentosCache.data;
+  }
 
-async function ensureMetasSheet() {
-  await ensureSheet(METAS_SHEET, ['Categoria', 'Valor']);
-}
-
-async function getLancamentos() {
-  await ensureLancamentosSheet();
-  const rows = await getRows(LANCAMENTOS_SHEET, `${LANCAMENTOS_SHEET}!A:G`);
-  return rows.slice(1).map((r, i) => ({
+  const rows = await getSheetValues(`${LANCAMENTOS_SHEET}!A:G`);
+  const parsed = rows.slice(1).map((r, i) => ({
     row: i + 2,
     id: Number(r[0] || 0),
     data: r[1] || '',
@@ -162,22 +169,31 @@ async function getLancamentos() {
     descricao: r[5] || '',
     usuario: r[6] || ''
   })).filter((r) => r.id && !Number.isNaN(r.valor));
+
+  lancamentosCache = { data: parsed, ts: Date.now() };
+  return parsed;
 }
 
-async function getMetas() {
-  await ensureMetasSheet();
-  const rows = await getRows(METAS_SHEET, `${METAS_SHEET}!A:B`);
-  return rows.slice(1).map((r, i) => ({
+async function getMetas(force = false) {
+  if (!force && metasCache.data && Date.now() - metasCache.ts < CACHE_MS) {
+    return metasCache.data;
+  }
+
+  const rows = await getSheetValues(`${METAS_SHEET}!A:B`);
+  const parsed = rows.slice(1).map((r, i) => ({
     row: i + 2,
     categoria: normalizeCategory(r[0] || ''),
     valor: Number(String(r[1] || '0').replace(',', '.'))
-  })).filter(r => r.categoria && !Number.isNaN(r.valor));
+  })).filter((r) => r.categoria && !Number.isNaN(r.valor));
+
+  metasCache = { data: parsed, ts: Date.now() };
+  return parsed;
 }
 
 async function setMeta(categoria, valor) {
   const metas = await getMetas();
   const cat = normalizeCategory(categoria);
-  const existente = metas.find(m => m.categoria === cat);
+  const existente = metas.find((m) => m.categoria === cat);
 
   if (existente) {
     await sheets.spreadsheets.values.update({
@@ -194,6 +210,8 @@ async function setMeta(categoria, valor) {
       requestBody: { values: [[cat, Number(valor)]] }
     });
   }
+
+  metasCache = { data: null, ts: 0 };
 }
 
 async function add(tipo, valor, categoria, desc, usuario = '') {
@@ -209,6 +227,7 @@ async function add(tipo, valor, categoria, desc, usuario = '') {
     }
   });
 
+  lancamentosCache = { data: null, ts: 0 };
   return id;
 }
 
@@ -219,6 +238,7 @@ async function updateCell(rowNumber, colLetter, value) {
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [[value]] }
   });
+  lancamentosCache = { data: null, ts: 0 };
 }
 
 async function deleteRow(rowNumber) {
@@ -243,6 +263,8 @@ async function deleteRow(rowNumber) {
       }]
     }
   });
+
+  lancamentosCache = { data: null, ts: 0 };
 }
 
 async function saldo() {
@@ -257,13 +279,14 @@ async function ultimos(limit = 5) {
 
 async function findById(id) {
   const rows = await getLancamentos();
-  return rows.find(r => r.id === Number(id)) || null;
+  return rows.find((r) => r.id === Number(id)) || null;
 }
 
 async function gastosPorCategoriaMes(refDate = new Date()) {
   const rows = await getLancamentos();
   const ym = monthKey(refDate);
   const totals = {};
+
   for (const row of rows) {
     const d = new Date(row.data);
     if (row.tipo === 'gasto' && monthKey(d) === ym) {
@@ -271,13 +294,15 @@ async function gastosPorCategoriaMes(refDate = new Date()) {
       totals[cat] = (totals[cat] || 0) + row.valor;
     }
   }
+
   return totals;
 }
 
 async function metasStatus(refDate = new Date()) {
   const metas = await getMetas();
   const gastos = await gastosPorCategoriaMes(refDate);
-  return metas.map(meta => {
+
+  return metas.map((meta) => {
     const gasto = gastos[meta.categoria] || 0;
     const percentual = meta.valor > 0 ? (gasto / meta.valor) * 100 : 0;
     return {
@@ -286,7 +311,7 @@ async function metasStatus(refDate = new Date()) {
       gasto,
       percentual
     };
-  }).sort((a,b) => b.percentual - a.percentual);
+  }).sort((a, b) => b.percentual - a.percentual);
 }
 
 async function resumoMensal(categoriaFiltro = null, refDate = new Date()) {
@@ -325,6 +350,7 @@ async function resumoMensal(categoriaFiltro = null, refDate = new Date()) {
   for (const [cat, valor] of itens) {
     msg += `• ${cat}: R$ ${money(valor)}\n`;
   }
+
   return msg;
 }
 
@@ -342,6 +368,7 @@ function interpretarRegra(texto) {
   if (!ehReceita && !ehGasto) return null;
 
   let categoria = 'geral';
+
   if (/(abasteci|gasolina|combustivel|combustível|posto|etanol|diesel)/i.test(t)) categoria = 'combustivel';
   else if (/(uber|99|taxi|táxi|transporte|corrida)/i.test(t)) categoria = 'transporte';
   else if (/(mercado|supermercado|padaria|feira|hortifruti)/i.test(t)) categoria = 'mercado';
@@ -359,6 +386,7 @@ function interpretarRegra(texto) {
 
 async function interpretar(texto, tentativas = 4) {
   let ultimoErro;
+
   for (let i = 0; i < tentativas; i++) {
     try {
       const res = await ai.models.generateContent({
@@ -371,22 +399,33 @@ Texto: ${texto}
 `,
         config: { responseMimeType: 'application/json' }
       });
+
       return JSON.parse(res.text || '{}');
     } catch (err) {
       ultimoErro = err;
       const status = err?.status || err?.error?.code;
-      const erroTemporario = status === 503 || status === 429 || String(err?.message || '').includes('high demand') || String(err?.message || '').includes('UNAVAILABLE');
-      if (!erroTemporario || i === tentativas - 1) throw err;
+      const erroTemporario =
+        status === 503 ||
+        status === 429 ||
+        String(err?.message || '').includes('high demand') ||
+        String(err?.message || '').includes('UNAVAILABLE');
+
+      if (!erroTemporario || i === tentativas - 1) {
+        throw err;
+      }
+
       await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
     }
   }
+
   throw ultimoErro;
 }
 
 async function checkMetaAlert(categoria, refDate = new Date()) {
   const status = await metasStatus(refDate);
   const cat = normalizeCategory(categoria);
-  const meta = status.find(m => m.categoria === cat);
+  const meta = status.find((m) => m.categoria === cat);
+
   if (!meta) return null;
   if (meta.percentual >= 100) return `🚨 Meta de ${cat} excedida: R$ ${money(meta.gasto)} de R$ ${money(meta.meta)} (${meta.percentual.toFixed(0)}%)`;
   if (meta.percentual >= 80) return `⚠️ Meta de ${cat} em ${meta.percentual.toFixed(0)}%: R$ ${money(meta.gasto)} de R$ ${money(meta.meta)}`;
@@ -399,7 +438,7 @@ app.get('/api', async (req, res) => {
     const category = req.query.category ? normalizeCategory(req.query.category) : null;
     const rows = await getLancamentos();
 
-    const filtered = rows.filter(r => {
+    const filtered = rows.filter((r) => {
       const d = new Date(r.data);
       const sameMonth = monthKey(d) === month;
       const sameCategory = !category || normalizeCategory(r.categoria) === category;
@@ -411,11 +450,12 @@ app.get('/api', async (req, res) => {
 
     const byCategory = {};
     const byDay = {};
+
     for (const row of filtered) {
       if (row.tipo === 'gasto') {
         const cat = normalizeCategory(row.categoria);
         byCategory[cat] = (byCategory[cat] || 0) + row.valor;
-        const day = new Date(row.data).toISOString().slice(0,10);
+        const day = new Date(row.data).toISOString().slice(0, 10);
         byDay[day] = (byDay[day] || 0) + row.valor;
       }
     }
@@ -426,10 +466,10 @@ app.get('/api', async (req, res) => {
       saldo: receita - gasto,
       gasto,
       receita,
-      ultimos: filtered.sort((a,b)=>b.id-a.id).slice(0,10),
+      ultimos: filtered.sort((a, b) => b.id - a.id).slice(0, 10),
       byCategory,
       byDay,
-      metas: await metasStatus(new Date(month + '-01T00:00:00Z'))
+      metas: await metasStatus(new Date(`${month}-01T00:00:00Z`))
     });
   } catch (e) {
     console.error('Erro API:', e);
@@ -438,12 +478,22 @@ app.get('/api', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('📊 Dashboard rodando');
+  console.log(`📊 Dashboard rodando na porta ${PORT}`);
+});
+
+(async () => {
+  await bootstrapSheets();
+  console.log('✅ Abas verificadas');
+})().catch((e) => {
+  console.error('Erro no bootstrap:', e);
 });
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const usuario = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || msg.from?.username || '';
+  const usuario =
+    [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') ||
+    msg.from?.username ||
+    '';
 
   try {
     if (!msg.text) {
@@ -518,7 +568,7 @@ bot.on('message', async (msg) => {
         await bot.sendMessage(chatId, 'Nenhuma meta cadastrada.');
         return;
       }
-      const txt = status.map(m => `• ${m.categoria}: R$ ${money(m.gasto)} / R$ ${money(m.meta)} (${m.percentual.toFixed(0)}%)`).join('\n');
+      const txt = status.map((m) => `• ${m.categoria}: R$ ${money(m.gasto)} / R$ ${money(m.meta)} (${m.percentual.toFixed(0)}%)`).join('\n');
       await bot.sendMessage(chatId, `🎯 Metas do mês\n\n${txt}`);
       return;
     }
@@ -549,7 +599,7 @@ bot.on('message', async (msg) => {
     if (t.startsWith('resumo ')) {
       const refDate = parseMonthRef(t);
       const monthWords = ['janeiro','fevereiro','marco','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro','mes passado','mês passado'];
-      const categoria = monthWords.some(w => t.includes(w)) ? null : t.replace('resumo ', '').trim();
+      const categoria = monthWords.some((w) => t.includes(w)) ? null : t.replace('resumo ', '').trim();
       await bot.sendMessage(chatId, await resumoMensal(categoria, refDate));
       return;
     }
@@ -588,10 +638,12 @@ bot.on('message', async (msg) => {
       if (t.includes(' valor ')) {
         const valueMatch = t.match(/\d+[.,]?\d*$/);
         const novoValor = valueMatch ? Number(valueMatch[0].replace(',', '.')) : null;
+
         if (!novoValor) {
           await bot.sendMessage(chatId, 'Use: editar 12 valor 120');
           return;
         }
+
         await updateCell(alvo.row, 'D', novoValor);
         await bot.sendMessage(chatId, `✏️ Lançamento #${id} atualizado.\nNovo valor: R$ ${money(novoValor)}`);
         return;
@@ -603,8 +655,10 @@ bot.on('message', async (msg) => {
           await bot.sendMessage(chatId, 'Use: editar 12 categoria transporte');
           return;
         }
-        await updateCell(alvo.row, 'E', normalizeCategory(novaCategoria));
-        await bot.sendMessage(chatId, `✏️ Lançamento #${id} atualizado.\nNova categoria: ${normalizeCategory(novaCategoria)}`);
+
+        const cat = normalizeCategory(novaCategoria);
+        await updateCell(alvo.row, 'E', cat);
+        await bot.sendMessage(chatId, `✏️ Lançamento #${id} atualizado.\nNova categoria: ${cat}`);
         return;
       }
 
@@ -613,6 +667,7 @@ bot.on('message', async (msg) => {
     }
 
     const tentativaRegra = interpretarRegra(msg.text);
+
     if (tentativaRegra) {
       const newId = await add(tentativaRegra.tipo, tentativaRegra.valor, tentativaRegra.categoria || 'geral', msg.text, usuario);
       const s = await saldo();
@@ -626,13 +681,14 @@ bot.on('message', async (msg) => {
     }
 
     const dados = await interpretar(msg.text);
+
     if (dados.eh && dados.valor) {
-      const cat = normalizeCategory(dados.categoria || 'geral');
-      const newId = await add(dados.tipo, dados.valor, cat, msg.text, usuario);
+      const categoria = normalizeCategory(dados.categoria || 'geral');
+      const newId = await add(dados.tipo, dados.valor, categoria, msg.text, usuario);
       const s = await saldo();
-      let resposta = `✔️ Lançamento #${newId} registrado\nR$ ${money(dados.valor)} (${cat})\nSaldo: R$ ${money(s)}`;
+      let resposta = `✔️ Lançamento #${newId} registrado\nR$ ${money(dados.valor)} (${categoria})\nSaldo: R$ ${money(s)}`;
       if (dados.tipo === 'gasto') {
-        const alerta = await checkMetaAlert(cat);
+        const alerta = await checkMetaAlert(categoria);
         if (alerta) resposta += `\n\n${alerta}`;
       }
       await bot.sendMessage(chatId, resposta);
@@ -643,11 +699,21 @@ bot.on('message', async (msg) => {
   } catch (e) {
     console.error('ERRO COMPLETO:', e);
     const mensagem = String(e?.message || '');
-    if (e?.status === 503 || mensagem.includes('high demand') || mensagem.includes('UNAVAILABLE')) {
+
+    if (
+      e?.status === 503 ||
+      mensagem.includes('high demand') ||
+      mensagem.includes('UNAVAILABLE')
+    ) {
       await bot.sendMessage(chatId, '⚠️ O Gemini está com alta demanda agora. Tente novamente em alguns segundos.');
       return;
     }
-    const msgErro = e?.message || e?.response?.data?.error?.message || 'Erro interno';
+
+    const msgErro =
+      e?.message ||
+      e?.response?.data?.error?.message ||
+      'Erro interno';
+
     await bot.sendMessage(chatId, `❌ ${msgErro}`);
   }
 });
