@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="pt-BR">
 <head>
@@ -10,16 +9,15 @@
     body{font-family:Arial,sans-serif;margin:0;background:#0b1020;color:#e8eefc}
     .wrap{max-width:1100px;margin:0 auto;padding:24px}
     .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
-    .card{background:#121933;border:1px solid #263055;border-radius:16px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+    .card{background:#121933;border:1px solid #263055;border-radius:16px;padding:18px}
     .title{font-size:13px;color:#9fb0e6;margin-bottom:8px}
     .value{font-size:28px;font-weight:700}
     .section{margin-top:24px}
     .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
     table{width:100%;border-collapse:collapse}
-    th,td{padding:10px 8px;border-bottom:1px solid #263055;text-align:left;font-size:14px}
+    th,td{padding:10px 8px;border-bottom:1px solid #263055}
     th{color:#9fb0e6}
     canvas{background:#121933;border-radius:16px;padding:8px}
-    @media (max-width:900px){.grid,.two{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -58,20 +56,23 @@
   </div>
 
 <script>
+let catChart;
+let dayChart;
+
 function money(v){ return 'R$ ' + Number(v || 0).toFixed(2).replace('.', ','); }
 
 async function load() {
-  const res = await fetch('/api/summary');
+  const res = await fetch('/api');
   const data = await res.json();
 
-  document.getElementById('saldoAtual').textContent = money(data.saldoAtual);
-  document.getElementById('gastoMes').textContent = money(data.totalGastoMes);
-  document.getElementById('receitaMes').textContent = money(data.totalReceitaMes);
-  document.getElementById('saldoMes').textContent = money(data.saldoMes);
+  document.getElementById('saldoAtual').textContent = money(data.saldo || 0);
+  document.getElementById('gastoMes').textContent = money(data.gasto || 0);
+  document.getElementById('receitaMes').textContent = money(data.receita || 0);
+  document.getElementById('saldoMes').textContent = money((data.receita || 0) - (data.gasto || 0));
 
   const latestBody = document.getElementById('latestBody');
   latestBody.innerHTML = '';
-  (data.latest || []).forEach(row => {
+  (data.ultimos || []).forEach(row => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${row.id}</td>
@@ -84,26 +85,60 @@ async function load() {
     latestBody.appendChild(tr);
   });
 
-  new Chart(document.getElementById('catChart'), {
-    type: 'bar',
-    data: {
-      labels: Object.keys(data.byCategory || {}),
-      datasets: [{ label: 'R$', data: Object.values(data.byCategory || {}) }]
-    },
-    options: { responsive: true, plugins: { legend: { display: false } } }
+  const byCategory = {};
+  (data.ultimos || []).forEach(row => {
+    if (row.tipo === 'gasto') {
+      byCategory[row.categoria] = (byCategory[row.categoria] || 0) + Number(row.valor || 0);
+    }
   });
 
-  const days = Object.keys(data.byDay || {}).sort();
-  new Chart(document.getElementById('dayChart'), {
-    type: 'line',
-    data: {
-      labels: days,
-      datasets: [{ label: 'R$', data: days.map(d => data.byDay[d]) }]
-    },
-    options: { responsive: true, plugins: { legend: { display: false } } }
+  const catLabels = Object.keys(byCategory);
+  const catValues = Object.values(byCategory);
+
+  if (catChart) {
+    catChart.data.labels = catLabels;
+    catChart.data.datasets[0].data = catValues;
+    catChart.update();
+  } else {
+    catChart = new Chart(document.getElementById('catChart'), {
+      type: 'bar',
+      data: {
+        labels: catLabels,
+        datasets: [{ label: 'R$', data: catValues }]
+      },
+      options: { responsive: true, plugins: { legend: { display: false } } }
+    });
+  }
+
+  const dayMap = {};
+  (data.ultimos || []).forEach(row => {
+    const day = new Date(row.data).toISOString().slice(0, 10);
+    if (row.tipo === 'gasto') {
+      dayMap[day] = (dayMap[day] || 0) + Number(row.valor || 0);
+    }
   });
+
+  const days = Object.keys(dayMap).sort();
+  const dayValues = days.map(d => dayMap[d]);
+
+  if (dayChart) {
+    dayChart.data.labels = days;
+    dayChart.data.datasets[0].data = dayValues;
+    dayChart.update();
+  } else {
+    dayChart = new Chart(document.getElementById('dayChart'), {
+      type: 'line',
+      data: {
+        labels: days,
+        datasets: [{ label: 'R$', data: dayValues }]
+      },
+      options: { responsive: true, plugins: { legend: { display: false } } }
+    });
+  }
 }
+
 load();
+setInterval(load, 10000);
 </script>
 </body>
 </html>
