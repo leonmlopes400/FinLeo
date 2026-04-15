@@ -1,0 +1,109 @@
+
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>FinLeo Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{font-family:Arial,sans-serif;margin:0;background:#0b1020;color:#e8eefc}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px}
+    .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+    .card{background:#121933;border:1px solid #263055;border-radius:16px;padding:18px;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+    .title{font-size:13px;color:#9fb0e6;margin-bottom:8px}
+    .value{font-size:28px;font-weight:700}
+    .section{margin-top:24px}
+    .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px 8px;border-bottom:1px solid #263055;text-align:left;font-size:14px}
+    th{color:#9fb0e6}
+    canvas{background:#121933;border-radius:16px;padding:8px}
+    @media (max-width:900px){.grid,.two{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>FinLeo Dashboard</h1>
+
+    <div class="grid">
+      <div class="card"><div class="title">Saldo atual</div><div class="value" id="saldoAtual">-</div></div>
+      <div class="card"><div class="title">Gastos do mês</div><div class="value" id="gastoMes">-</div></div>
+      <div class="card"><div class="title">Receitas do mês</div><div class="value" id="receitaMes">-</div></div>
+      <div class="card"><div class="title">Saldo do mês</div><div class="value" id="saldoMes">-</div></div>
+    </div>
+
+    <div class="section two">
+      <div class="card">
+        <div class="title">Gastos por categoria</div>
+        <canvas id="catChart"></canvas>
+      </div>
+      <div class="card">
+        <div class="title">Gastos por dia</div>
+        <canvas id="dayChart"></canvas>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="card">
+        <div class="title">Últimos lançamentos</div>
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Data</th><th>Tipo</th><th>Valor</th><th>Categoria</th><th>Descrição</th></tr>
+          </thead>
+          <tbody id="latestBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+function money(v){ return 'R$ ' + Number(v || 0).toFixed(2).replace('.', ','); }
+
+async function load() {
+  const res = await fetch('/api/summary');
+  const data = await res.json();
+
+  document.getElementById('saldoAtual').textContent = money(data.saldoAtual);
+  document.getElementById('gastoMes').textContent = money(data.totalGastoMes);
+  document.getElementById('receitaMes').textContent = money(data.totalReceitaMes);
+  document.getElementById('saldoMes').textContent = money(data.saldoMes);
+
+  const latestBody = document.getElementById('latestBody');
+  latestBody.innerHTML = '';
+  (data.latest || []).forEach(row => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${row.id}</td>
+      <td>${new Date(row.data).toLocaleString('pt-BR')}</td>
+      <td>${row.tipo}</td>
+      <td>${money(row.valor)}</td>
+      <td>${row.categoria}</td>
+      <td>${row.descricao || ''}</td>
+    `;
+    latestBody.appendChild(tr);
+  });
+
+  new Chart(document.getElementById('catChart'), {
+    type: 'bar',
+    data: {
+      labels: Object.keys(data.byCategory || {}),
+      datasets: [{ label: 'R$', data: Object.values(data.byCategory || {}) }]
+    },
+    options: { responsive: true, plugins: { legend: { display: false } } }
+  });
+
+  const days = Object.keys(data.byDay || {}).sort();
+  new Chart(document.getElementById('dayChart'), {
+    type: 'line',
+    data: {
+      labels: days,
+      datasets: [{ label: 'R$', data: days.map(d => data.byDay[d]) }]
+    },
+    options: { responsive: true, plugins: { legend: { display: false } } }
+  });
+}
+load();
+</script>
+</body>
+</html>
