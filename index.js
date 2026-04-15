@@ -3,7 +3,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenAI, createUserContent, createPartFromUri } = require('@google/genai');
 const { google } = require('googleapis');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -307,6 +307,58 @@ Texto: ${texto}
   throw ultimoErro;
 }
 
+async function interpretarArquivoComGemini(filePath, mimeType, instrucoes, tentativas = 4) {
+  let ultimoErro;
+
+  for (let i = 0; i < tentativas; i++) {
+    try {
+      const uploaded = await ai.files.upload({
+        file: filePath,
+        config: { mimeType }
+      });
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: createUserContent([
+          instrucoes,
+          createPartFromUri(uploaded.uri, uploaded.mimeType)
+        ]),
+        config: {
+          responseMimeType: 'application/json'
+        }
+      });
+
+      return JSON.parse(response.text || '{}');
+    } catch (err) {
+      ultimoErro = err;
+      const status = err?.status || err?.error?.code;
+      const erroTemporario =
+        status === 503 ||
+        status === 429 ||
+        String(err?.message || '').includes('high demand') ||
+        String(err?.message || '').includes('UNAVAILABLE');
+
+      if (!erroTemporario || i === tentativas - 1) {
+        throw err;
+      }
+
+      const espera = 1500 * (i + 1);
+      await new Promise((resolve) => setTimeout(resolve, espera));
+    }
+  }
+
+  throw ultimoErro;
+}
+
+async function baixarArquivoTelegram(fileId, destino) {
+  const fileLink = await bot.getFileLink(fileId);
+  const response = await axios.get(fileLink, {
+    responseType: 'arraybuffer',
+    timeout: 60000
+  });
+  fs.writeFileSync(destino, response.data);
+}
+
 app.get('/api', async (_req, res) => {
   try {
     const rows = await getRows();
@@ -331,137 +383,213 @@ app.listen(PORT, () => {
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
+  const usuario =
+    [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') ||
+    msg.from?.username ||
+    '';
 
   try {
-    if (!msg.text) {
-      await bot.sendMessage(chatId, 'Envie texto.');
-      return;
-    }
+    if (msg.text) {
+      const t = clean(msg.text);
 
-    const t = clean(msg.text);
-
-    if (t === '/start' || t === 'start') {
-      await bot.sendMessage(chatId, [
-        'FinLeo PRO ativo 🚀',
-        '',
-        'Comandos:',
-        '• saldo',
-        '• resumo',
-        '• resumo mercado',
-        '• hoje',
-        '• ultimos',
-        '• editar valor 120',
-        '• editar categoria transporte',
-        '• apagar'
-      ].join('\n'));
-      return;
-    }
-
-    if (t === 'saldo') {
-      const s = await saldo();
-      await bot.sendMessage(chatId, `💰 R$ ${money(s)}`);
-      return;
-    }
-
-    if (t === 'ultimos' || t === 'últimos') {
-      const u = await ultimos();
-      if (!u.length) {
-        await bot.sendMessage(chatId, 'Nenhum lançamento encontrado.');
-        return;
-      }
-      const txt = u.map((x) => `#${x.id} ${x.categoria} • R$ ${money(x.valor)} • ${x.descricao}`).join('\n');
-      await bot.sendMessage(chatId, `🧾 Últimos lançamentos\n\n${txt}`);
-      return;
-    }
-
-    if (t === 'hoje') {
-      await bot.sendMessage(chatId, await resumoHoje());
-      return;
-    }
-
-    if (t === 'resumo') {
-      await bot.sendMessage(chatId, await resumoMensal());
-      return;
-    }
-
-    if (t.startsWith('resumo ')) {
-      const categoria = t.replace('resumo ', '').trim();
-      await bot.sendMessage(chatId, await resumoMensal(categoria));
-      return;
-    }
-
-    if (t === 'apagar' || t === 'apagar ultimo' || t === 'apagar último') {
-      const u = await ultimos(1);
-      if (!u.length) {
-        await bot.sendMessage(chatId, 'Nenhum lançamento para apagar.');
-        return;
-      }
-      await deleteRow(u[0].row);
-      await bot.sendMessage(chatId, `🗑️ Lançamento #${u[0].id} apagado.`);
-      return;
-    }
-
-    if (t.startsWith('editar valor')) {
-      const match = t.match(/\d+[.,]?\d*/);
-      const novoValor = match ? Number(match[0].replace(',', '.')) : null;
-
-      if (!novoValor) {
-        await bot.sendMessage(chatId, 'Use: editar valor 120');
+      if (t === '/start' || t === 'start') {
+        await bot.sendMessage(chatId, [
+          'FinLeo PRO ativo 🚀',
+          '',
+          'Comandos:',
+          '• saldo',
+          '• resumo',
+          '• resumo mercado',
+          '• hoje',
+          '• ultimos',
+          '• editar valor 120',
+          '• editar categoria transporte',
+          '• apagar',
+          '',
+          'Também aceita:',
+          '• texto',
+          '• áudio',
+          '• imagem de recibo'
+        ].join('\n'));
         return;
       }
 
-      const u = await ultimos(1);
-      if (!u.length) {
-        await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
+      if (t === 'saldo') {
+        const s = await saldo();
+        await bot.sendMessage(chatId, `💰 R$ ${money(s)}`);
         return;
       }
 
-      await updateCell(u[0].row, 'D', novoValor);
-      await bot.sendMessage(chatId, `✏️ Valor do lançamento #${u[0].id} atualizado para R$ ${money(novoValor)}.`);
+      if (t === 'ultimos' || t === 'últimos') {
+        const u = await ultimos();
+        if (!u.length) {
+          await bot.sendMessage(chatId, 'Nenhum lançamento encontrado.');
+          return;
+        }
+        const txt = u.map((x) => `#${x.id} ${x.categoria} • R$ ${money(x.valor)} • ${x.descricao}`).join('\n');
+        await bot.sendMessage(chatId, `🧾 Últimos lançamentos\n\n${txt}`);
+        return;
+      }
+
+      if (t === 'hoje') {
+        await bot.sendMessage(chatId, await resumoHoje());
+        return;
+      }
+
+      if (t === 'resumo') {
+        await bot.sendMessage(chatId, await resumoMensal());
+        return;
+      }
+
+      if (t.startsWith('resumo ')) {
+        const categoria = t.replace('resumo ', '').trim();
+        await bot.sendMessage(chatId, await resumoMensal(categoria));
+        return;
+      }
+
+      if (t === 'apagar' || t === 'apagar ultimo' || t === 'apagar último') {
+        const u = await ultimos(1);
+        if (!u.length) {
+          await bot.sendMessage(chatId, 'Nenhum lançamento para apagar.');
+          return;
+        }
+        await deleteRow(u[0].row);
+        await bot.sendMessage(chatId, `🗑️ Lançamento #${u[0].id} apagado.`);
+        return;
+      }
+
+      if (t.startsWith('editar valor')) {
+        const match = t.match(/\d+[.,]?\d*/);
+        const novoValor = match ? Number(match[0].replace(',', '.')) : null;
+
+        if (!novoValor) {
+          await bot.sendMessage(chatId, 'Use: editar valor 120');
+          return;
+        }
+
+        const u = await ultimos(1);
+        if (!u.length) {
+          await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
+          return;
+        }
+
+        await updateCell(u[0].row, 'D', novoValor);
+        await bot.sendMessage(chatId, `✏️ Valor do lançamento #${u[0].id} atualizado para R$ ${money(novoValor)}.`);
+        return;
+      }
+
+      if (t.startsWith('editar categoria')) {
+        const categoria = t.replace('editar categoria', '').trim();
+
+        if (!categoria) {
+          await bot.sendMessage(chatId, 'Use: editar categoria transporte');
+          return;
+        }
+
+        const u = await ultimos(1);
+        if (!u.length) {
+          await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
+          return;
+        }
+
+        await updateCell(u[0].row, 'E', categoria);
+        await bot.sendMessage(chatId, `✏️ Categoria do lançamento #${u[0].id} atualizada para ${categoria}.`);
+        return;
+      }
+
+      const tentativaRegra = interpretarRegra(msg.text);
+
+      if (tentativaRegra) {
+        await add(tentativaRegra.tipo, tentativaRegra.valor, tentativaRegra.categoria || 'geral', msg.text, usuario);
+        const s = await saldo();
+        await bot.sendMessage(
+          chatId,
+          `✔️ R$ ${money(tentativaRegra.valor)} (${tentativaRegra.categoria})\nSaldo: R$ ${money(s)}`
+        );
+        return;
+      }
+
+      const dados = await interpretar(msg.text);
+
+      if (dados.eh && dados.valor) {
+        await add(dados.tipo, dados.valor, dados.categoria || 'geral', msg.text, usuario);
+        const s = await saldo();
+        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
+        return;
+      }
+
+      await bot.sendMessage(chatId, 'Não entendi');
       return;
     }
 
-    if (t.startsWith('editar categoria')) {
-      const categoria = t.replace('editar categoria', '').trim();
+    if (msg.voice) {
+      const filePath = '/tmp/telegram_voice.ogg';
+      await baixarArquivoTelegram(msg.voice.file_id, filePath);
 
-      if (!categoria) {
-        await bot.sendMessage(chatId, 'Use: editar categoria transporte');
-        return;
-      }
-
-      const u = await ultimos(1);
-      if (!u.length) {
-        await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
-        return;
-      }
-
-      await updateCell(u[0].row, 'E', categoria);
-      await bot.sendMessage(chatId, `✏️ Categoria do lançamento #${u[0].id} atualizada para ${categoria}.`);
-      return;
-    }
-
-    const tentativaRegra = interpretarRegra(msg.text);
-
-    if (tentativaRegra) {
-      await add(tentativaRegra.tipo, tentativaRegra.valor, tentativaRegra.categoria || 'geral', msg.text);
-      const s = await saldo();
-      await bot.sendMessage(
-        chatId,
-        `✔️ R$ ${money(tentativaRegra.valor)} (${tentativaRegra.categoria})\nSaldo: R$ ${money(s)}`
+      const dados = await interpretarArquivoComGemini(
+        filePath,
+        'audio/ogg',
+        `Transcreva e interprete este áudio em português.
+Responda apenas JSON válido com:
+{
+  "eh": true,
+  "tipo": "gasto|receita|null",
+  "valor": number|null,
+  "categoria": "string|null",
+  "texto_transcrito": "string|null"
+}
+Se não for um lançamento financeiro, responda:
+{"eh": false, "tipo": null, "valor": null, "categoria": null, "texto_transcrito": "texto" }`
       );
+
+      if (dados.texto_transcrito) {
+        await bot.sendMessage(chatId, `🎤 Entendi: "${dados.texto_transcrito}"`);
+      }
+
+      if (dados.eh && dados.valor) {
+        await add(dados.tipo, dados.valor, dados.categoria || 'geral', dados.texto_transcrito || 'áudio', usuario);
+        const s = await saldo();
+        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
+        return;
+      }
+
+      await bot.sendMessage(chatId, 'Não consegui identificar um lançamento nesse áudio.');
       return;
     }
 
-    const dados = await interpretar(msg.text);
+    if (msg.photo && msg.photo.length > 0) {
+      const maior = msg.photo[msg.photo.length - 1];
+      const filePath = '/tmp/telegram_photo.jpg';
+      await baixarArquivoTelegram(maior.file_id, filePath);
 
-    if (dados.eh && dados.valor) {
-      await add(dados.tipo, dados.valor, dados.categoria || 'geral', msg.text);
-      const s = await saldo();
-      await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
+      const dados = await interpretarArquivoComGemini(
+        filePath,
+        'image/jpeg',
+        `Analise esta imagem de recibo, nota, comprovante ou foto relacionada a gasto.
+Responda apenas JSON válido com:
+{
+  "eh": true,
+  "tipo": "gasto|receita|null",
+  "valor": number|null,
+  "categoria": "string|null",
+  "descricao": "string|null"
+}
+Se não houver lançamento identificável, responda:
+{"eh": false, "tipo": null, "valor": null, "categoria": null, "descricao": null}`
+      );
+
+      if (dados.eh && dados.valor) {
+        await add(dados.tipo, dados.valor, dados.categoria || 'geral', dados.descricao || 'imagem', usuario);
+        const s = await saldo();
+        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
+        return;
+      }
+
+      await bot.sendMessage(chatId, 'Não consegui identificar um lançamento nessa imagem.');
       return;
     }
 
-    await bot.sendMessage(chatId, 'Não entendi');
+    await bot.sendMessage(chatId, 'Envie texto, áudio ou imagem.');
   } catch (e) {
     console.error('ERRO COMPLETO:', e);
 
@@ -476,12 +604,12 @@ bot.on('message', async (msg) => {
       return;
     }
 
-    const msg =
+    const erroMsg =
       e?.message ||
       e?.response?.data?.error?.message ||
       'Erro interno';
 
-    await bot.sendMessage(chatId, `❌ ${msg}`);
+    await bot.sendMessage(chatId, `❌ ${erroMsg}`);
   }
 });
 
