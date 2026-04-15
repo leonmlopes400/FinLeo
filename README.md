@@ -1,35 +1,18 @@
+# FinLeo atualização completa
 
-# FinLeo Pro Dashboard
+Inclui:
+- editar por ID
+- confirmação de apagar
+- filtros por período no bot
+- metas
+- dashboard com filtros por mês e categoria
+- indicadores de metas no dashboard
 
-Projeto com:
-- bot no Telegram
-- comandos avançados
-- dashboard web
-- Gemini para texto, áudio e imagem
-- Google Sheets como base
-
-## Variáveis de ambiente
-- TELEGRAM_BOT_TOKEN
-- GEMINI_API_KEY
-- SPREADSHEET_ID
-- GOOGLE_CREDENTIALS
-- PORT
-
-## Comandos do bot
-- /start
-- saldo
-- resumo
-- resumo mercado
-- hoje
-- ultimos
-- editar valor 120
-- editar categoria transporte
-- apagar
-
-## Estrutura da planilha
-Aba: Lancamentos
-Colunas:
-ID | Data | Tipo | Valor | Categoria | Descrição | Usuário
-
-## Start command no Railway
-node index.js
+Comandos:
+- meta mercado 800
+- metas
+- editar 12 valor 120
+- editar 12 categoria transporte
+- apagar 12
+- resumo janeiro
+- mes passado

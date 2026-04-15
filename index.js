@@ -3,7 +3,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const TelegramBot = require('node-telegram-bot-api');
-const { GoogleGenAI, createUserContent, createPartFromUri } = require('@google/genai');
+const { GoogleGenAI } = require('@google/genai');
 const { google } = require('googleapis');
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -24,7 +24,8 @@ const auth = new google.auth.GoogleAuth({
 });
 
 const sheets = google.sheets({ version: 'v4', auth });
-const SHEET = 'Lancamentos';
+const LANCAMENTOS_SHEET = 'Lancamentos';
+const METAS_SHEET = 'Metas';
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -37,9 +38,10 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
   }
 });
 
+const pendingDelete = new Map();
+
 bot.on('polling_error', async (error) => {
   console.error('Polling error:', error?.message || error);
-
   if (String(error?.message || '').includes('409')) {
     try {
       await bot.stopPolling();
@@ -64,43 +66,92 @@ function clean(text) {
     .trim();
 }
 
-async function ensureSheet() {
+function normalizeCategory(text) {
+  return (text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '_')
+    .trim();
+}
+
+function monthKey(date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function parseMonthRef(text) {
+  const t = clean(text);
+  const now = new Date();
+  const months = {
+    janeiro: 0, fevereiro: 1, marco: 2, março: 2, abril: 3, maio: 4, junho: 5,
+    julho: 6, agosto: 7, setembro: 8, outubro: 9, novembro: 10, dezembro: 11
+  };
+
+  if (t.includes('mes passado') || t.includes('mês passado')) {
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  }
+
+  const anoMatch = t.match(/20\d{2}/);
+  const year = anoMatch ? Number(anoMatch[0]) : now.getUTCFullYear();
+
+  for (const [name, idx] of Object.entries(months)) {
+    if (t.includes(name)) {
+      return new Date(Date.UTC(year, idx, 1));
+    }
+  }
+  return now;
+}
+
+async function ensureSheet(sheetName, header) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const tab = (meta.data.sheets || []).find(
-    (s) => s.properties && s.properties.title === SHEET
+    (s) => s.properties && s.properties.title === sheetName
   );
 
   if (!tab) {
-    throw new Error(`Aba "${SHEET}" não encontrada na planilha`);
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        requests: [{ addSheet: { properties: { title: sheetName } } }]
+      }
+    });
   }
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!A1:G2`
+    range: `${sheetName}!A1:Z2`
   }).catch(() => ({ data: { values: [] } }));
 
   const values = res.data.values || [];
-  const header = ['ID', 'Data', 'Tipo', 'Valor', 'Categoria', 'Descrição', 'Usuário'];
-
   if (!values.length || values[0].join('|') !== header.join('|')) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `${SHEET}!A1:G1`,
+      range: `${sheetName}!A1:${String.fromCharCode(64 + header.length)}1`,
       valueInputOption: 'RAW',
       requestBody: { values: [header] }
     });
   }
 }
 
-async function getRows() {
-  await ensureSheet();
-
+async function getRows(sheetName, range) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!A:G`
+    range
   });
+  return res.data.values || [];
+}
 
-  const rows = res.data.values || [];
+async function ensureLancamentosSheet() {
+  await ensureSheet(LANCAMENTOS_SHEET, ['ID', 'Data', 'Tipo', 'Valor', 'Categoria', 'Descrição', 'Usuário']);
+}
+
+async function ensureMetasSheet() {
+  await ensureSheet(METAS_SHEET, ['Categoria', 'Valor']);
+}
+
+async function getLancamentos() {
+  await ensureLancamentosSheet();
+  const rows = await getRows(LANCAMENTOS_SHEET, `${LANCAMENTOS_SHEET}!A:G`);
   return rows.slice(1).map((r, i) => ({
     row: i + 2,
     id: Number(r[0] || 0),
@@ -113,16 +164,48 @@ async function getRows() {
   })).filter((r) => r.id && !Number.isNaN(r.valor));
 }
 
+async function getMetas() {
+  await ensureMetasSheet();
+  const rows = await getRows(METAS_SHEET, `${METAS_SHEET}!A:B`);
+  return rows.slice(1).map((r, i) => ({
+    row: i + 2,
+    categoria: normalizeCategory(r[0] || ''),
+    valor: Number(String(r[1] || '0').replace(',', '.'))
+  })).filter(r => r.categoria && !Number.isNaN(r.valor));
+}
+
+async function setMeta(categoria, valor) {
+  const metas = await getMetas();
+  const cat = normalizeCategory(categoria);
+  const existente = metas.find(m => m.categoria === cat);
+
+  if (existente) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${METAS_SHEET}!B${existente.row}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [[Number(valor)]] }
+    });
+  } else {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${METAS_SHEET}!A:B`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: [[cat, Number(valor)]] }
+    });
+  }
+}
+
 async function add(tipo, valor, categoria, desc, usuario = '') {
-  const rows = await getRows();
+  const rows = await getLancamentos();
   const id = rows.length ? Math.max(...rows.map((r) => r.id)) + 1 : 1;
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!A:G`,
+    range: `${LANCAMENTOS_SHEET}!A:G`,
     valueInputOption: 'USER_ENTERED',
     requestBody: {
-      values: [[id, new Date().toISOString(), tipo, Number(valor), categoria, desc, usuario]]
+      values: [[id, new Date().toISOString(), tipo, Number(valor), normalizeCategory(categoria), desc, usuario]]
     }
   });
 
@@ -132,7 +215,7 @@ async function add(tipo, valor, categoria, desc, usuario = '') {
 async function updateCell(rowNumber, colLetter, value) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET}!${colLetter}${rowNumber}`,
+    range: `${LANCAMENTOS_SHEET}!${colLetter}${rowNumber}`,
     valueInputOption: 'USER_ENTERED',
     requestBody: { values: [[value]] }
   });
@@ -141,48 +224,79 @@ async function updateCell(rowNumber, colLetter, value) {
 async function deleteRow(rowNumber) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
   const sheet = (meta.data.sheets || []).find(
-    (s) => s.properties && s.properties.title === SHEET
+    (s) => s.properties && s.properties.title === LANCAMENTOS_SHEET
   );
-  if (!sheet) throw new Error(`Aba "${SHEET}" não encontrada`);
+  if (!sheet) throw new Error(`Aba "${LANCAMENTOS_SHEET}" não encontrada`);
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     requestBody: {
-      requests: [
-        {
-          deleteDimension: {
-            range: {
-              sheetId: sheet.properties.sheetId,
-              dimension: 'ROWS',
-              startIndex: rowNumber - 1,
-              endIndex: rowNumber
-            }
+      requests: [{
+        deleteDimension: {
+          range: {
+            sheetId: sheet.properties.sheetId,
+            dimension: 'ROWS',
+            startIndex: rowNumber - 1,
+            endIndex: rowNumber
           }
         }
-      ]
+      }]
     }
   });
 }
 
 async function saldo() {
-  const rows = await getRows();
+  const rows = await getLancamentos();
   return rows.reduce((acc, r) => acc + (r.tipo === 'receita' ? r.valor : -r.valor), 0);
 }
 
 async function ultimos(limit = 5) {
-  const rows = await getRows();
+  const rows = await getLancamentos();
   return rows.sort((a, b) => b.id - a.id).slice(0, limit);
 }
 
-async function resumoMensal(categoriaFiltro = null) {
-  const rows = await getRows();
-  const now = new Date();
-  const ym = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+async function findById(id) {
+  const rows = await getLancamentos();
+  return rows.find(r => r.id === Number(id)) || null;
+}
+
+async function gastosPorCategoriaMes(refDate = new Date()) {
+  const rows = await getLancamentos();
+  const ym = monthKey(refDate);
+  const totals = {};
+  for (const row of rows) {
+    const d = new Date(row.data);
+    if (row.tipo === 'gasto' && monthKey(d) === ym) {
+      const cat = normalizeCategory(row.categoria);
+      totals[cat] = (totals[cat] || 0) + row.valor;
+    }
+  }
+  return totals;
+}
+
+async function metasStatus(refDate = new Date()) {
+  const metas = await getMetas();
+  const gastos = await gastosPorCategoriaMes(refDate);
+  return metas.map(meta => {
+    const gasto = gastos[meta.categoria] || 0;
+    const percentual = meta.valor > 0 ? (gasto / meta.valor) * 100 : 0;
+    return {
+      categoria: meta.categoria,
+      meta: meta.valor,
+      gasto,
+      percentual
+    };
+  }).sort((a,b) => b.percentual - a.percentual);
+}
+
+async function resumoMensal(categoriaFiltro = null, refDate = new Date()) {
+  const rows = await getLancamentos();
+  const ym = monthKey(refDate);
 
   const filtered = rows.filter((r) => {
     const d = new Date(r.data);
-    const sameMonth = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}` === ym;
-    const sameCategory = !categoriaFiltro || (r.categoria || '').toLowerCase() === categoriaFiltro.toLowerCase();
+    const sameMonth = monthKey(d) === ym;
+    const sameCategory = !categoriaFiltro || normalizeCategory(r.categoria) === normalizeCategory(categoriaFiltro);
     return sameMonth && sameCategory;
   });
 
@@ -193,14 +307,15 @@ async function resumoMensal(categoriaFiltro = null) {
   for (const row of filtered) {
     if (row.tipo === 'gasto') {
       gasto += row.valor;
-      byCategory[row.categoria] = (byCategory[row.categoria] || 0) + row.valor;
+      const cat = normalizeCategory(row.categoria);
+      byCategory[cat] = (byCategory[cat] || 0) + row.valor;
     } else if (row.tipo === 'receita') {
       receita += row.valor;
     }
   }
 
-  let msg = '📊 Resumo do mês';
-  if (categoriaFiltro) msg += ` (${categoriaFiltro})`;
+  let msg = `📊 Resumo de ${ym}`;
+  if (categoriaFiltro) msg += ` (${normalizeCategory(categoriaFiltro)})`;
   msg += `\n\n💸 Gastos: R$ ${money(gasto)}\n💰 Receitas: R$ ${money(receita)}\n🟰 Saldo: R$ ${money(receita - gasto)}\n\n`;
 
   const itens = Object.entries(byCategory).sort((a, b) => b[1] - a[1]);
@@ -210,30 +325,6 @@ async function resumoMensal(categoriaFiltro = null) {
   for (const [cat, valor] of itens) {
     msg += `• ${cat}: R$ ${money(valor)}\n`;
   }
-  return msg;
-}
-
-async function resumoHoje() {
-  const rows = await getRows();
-  const now = new Date();
-
-  const filtered = rows.filter((r) => {
-    const d = new Date(r.data);
-    return d.getUTCFullYear() === now.getUTCFullYear()
-      && d.getUTCMonth() === now.getUTCMonth()
-      && d.getUTCDate() === now.getUTCDate();
-  });
-
-  let gasto = 0;
-  let receita = 0;
-
-  for (const row of filtered) {
-    if (row.tipo === 'gasto') gasto += row.valor;
-    if (row.tipo === 'receita') receita += row.valor;
-  }
-
-  let msg = `📅 Hoje\n\n💸 Gastos: R$ ${money(gasto)}\n💰 Receitas: R$ ${money(receita)}\n🟰 Saldo: R$ ${money(receita - gasto)}\n`;
-  if (!filtered.length) msg += '\nNenhum lançamento hoje.';
   return msg;
 }
 
@@ -251,7 +342,6 @@ function interpretarRegra(texto) {
   if (!ehReceita && !ehGasto) return null;
 
   let categoria = 'geral';
-
   if (/(abasteci|gasolina|combustivel|combustível|posto|etanol|diesel)/i.test(t)) categoria = 'combustivel';
   else if (/(uber|99|taxi|táxi|transporte|corrida)/i.test(t)) categoria = 'transporte';
   else if (/(mercado|supermercado|padaria|feira|hortifruti)/i.test(t)) categoria = 'mercado';
@@ -269,7 +359,6 @@ function interpretarRegra(texto) {
 
 async function interpretar(texto, tentativas = 4) {
   let ultimoErro;
-
   for (let i = 0; i < tentativas; i++) {
     try {
       const res = await ai.models.generateContent({
@@ -280,96 +369,67 @@ Extraia JSON:
 
 Texto: ${texto}
 `,
-        config: {
-          responseMimeType: 'application/json'
-        }
+        config: { responseMimeType: 'application/json' }
       });
-
       return JSON.parse(res.text || '{}');
     } catch (err) {
       ultimoErro = err;
       const status = err?.status || err?.error?.code;
-      const erroTemporario =
-        status === 503 ||
-        status === 429 ||
-        String(err?.message || '').includes('high demand') ||
-        String(err?.message || '').includes('UNAVAILABLE');
-
-      if (!erroTemporario || i === tentativas - 1) {
-        throw err;
-      }
-
-      const espera = 1500 * (i + 1);
-      await new Promise((resolve) => setTimeout(resolve, espera));
+      const erroTemporario = status === 503 || status === 429 || String(err?.message || '').includes('high demand') || String(err?.message || '').includes('UNAVAILABLE');
+      if (!erroTemporario || i === tentativas - 1) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
     }
   }
-
   throw ultimoErro;
 }
 
-async function interpretarArquivoComGemini(filePath, mimeType, instrucoes, tentativas = 4) {
-  let ultimoErro;
-
-  for (let i = 0; i < tentativas; i++) {
-    try {
-      const uploaded = await ai.files.upload({
-        file: filePath,
-        config: { mimeType }
-      });
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: createUserContent([
-          instrucoes,
-          createPartFromUri(uploaded.uri, uploaded.mimeType)
-        ]),
-        config: {
-          responseMimeType: 'application/json'
-        }
-      });
-
-      return JSON.parse(response.text || '{}');
-    } catch (err) {
-      ultimoErro = err;
-      const status = err?.status || err?.error?.code;
-      const erroTemporario =
-        status === 503 ||
-        status === 429 ||
-        String(err?.message || '').includes('high demand') ||
-        String(err?.message || '').includes('UNAVAILABLE');
-
-      if (!erroTemporario || i === tentativas - 1) {
-        throw err;
-      }
-
-      const espera = 1500 * (i + 1);
-      await new Promise((resolve) => setTimeout(resolve, espera));
-    }
-  }
-
-  throw ultimoErro;
+async function checkMetaAlert(categoria, refDate = new Date()) {
+  const status = await metasStatus(refDate);
+  const cat = normalizeCategory(categoria);
+  const meta = status.find(m => m.categoria === cat);
+  if (!meta) return null;
+  if (meta.percentual >= 100) return `🚨 Meta de ${cat} excedida: R$ ${money(meta.gasto)} de R$ ${money(meta.meta)} (${meta.percentual.toFixed(0)}%)`;
+  if (meta.percentual >= 80) return `⚠️ Meta de ${cat} em ${meta.percentual.toFixed(0)}%: R$ ${money(meta.gasto)} de R$ ${money(meta.meta)}`;
+  return null;
 }
 
-async function baixarArquivoTelegram(fileId, destino) {
-  const fileLink = await bot.getFileLink(fileId);
-  const response = await axios.get(fileLink, {
-    responseType: 'arraybuffer',
-    timeout: 60000
-  });
-  fs.writeFileSync(destino, response.data);
-}
-
-app.get('/api', async (_req, res) => {
+app.get('/api', async (req, res) => {
   try {
-    const rows = await getRows();
-    const gasto = rows.filter((r) => r.tipo === 'gasto').reduce((a, b) => a + b.valor, 0);
-    const receita = rows.filter((r) => r.tipo === 'receita').reduce((a, b) => a + b.valor, 0);
+    const month = req.query.month || monthKey(new Date());
+    const category = req.query.category ? normalizeCategory(req.query.category) : null;
+    const rows = await getLancamentos();
+
+    const filtered = rows.filter(r => {
+      const d = new Date(r.data);
+      const sameMonth = monthKey(d) === month;
+      const sameCategory = !category || normalizeCategory(r.categoria) === category;
+      return sameMonth && sameCategory;
+    });
+
+    const gasto = filtered.filter((r) => r.tipo === 'gasto').reduce((a, b) => a + b.valor, 0);
+    const receita = filtered.filter((r) => r.tipo === 'receita').reduce((a, b) => a + b.valor, 0);
+
+    const byCategory = {};
+    const byDay = {};
+    for (const row of filtered) {
+      if (row.tipo === 'gasto') {
+        const cat = normalizeCategory(row.categoria);
+        byCategory[cat] = (byCategory[cat] || 0) + row.valor;
+        const day = new Date(row.data).toISOString().slice(0,10);
+        byDay[day] = (byDay[day] || 0) + row.valor;
+      }
+    }
 
     res.json({
+      month,
+      category,
       saldo: receita - gasto,
       gasto,
       receita,
-      ultimos: rows.slice(-10).reverse()
+      ultimos: filtered.sort((a,b)=>b.id-a.id).slice(0,10),
+      byCategory,
+      byDay,
+      metas: await metasStatus(new Date(month + '-01T00:00:00Z'))
     });
   } catch (e) {
     console.error('Erro API:', e);
@@ -383,233 +443,212 @@ app.listen(PORT, () => {
 
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
-  const usuario =
-    [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') ||
-    msg.from?.username ||
-    '';
+  const usuario = [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || msg.from?.username || '';
 
   try {
-    if (msg.text) {
-      const t = clean(msg.text);
+    if (!msg.text) {
+      await bot.sendMessage(chatId, 'Envie texto.');
+      return;
+    }
 
-      if (t === '/start' || t === 'start') {
-        await bot.sendMessage(chatId, [
-          'FinLeo PRO ativo 🚀',
-          '',
-          'Comandos:',
-          '• saldo',
-          '• resumo',
-          '• resumo mercado',
-          '• hoje',
-          '• ultimos',
-          '• editar valor 120',
-          '• editar categoria transporte',
-          '• apagar',
-          '',
-          'Também aceita:',
-          '• texto',
-          '• áudio',
-          '• imagem de recibo'
-        ].join('\n'));
+    const t = clean(msg.text);
+
+    if (pendingDelete.has(chatId) && (t === 'sim' || t === 'nao' || t === 'não')) {
+      const targetId = pendingDelete.get(chatId);
+      pendingDelete.delete(chatId);
+
+      if (t === 'nao' || t === 'não') {
+        await bot.sendMessage(chatId, '✅ Exclusão cancelada.');
         return;
       }
 
-      if (t === 'saldo') {
-        const s = await saldo();
-        await bot.sendMessage(chatId, `💰 R$ ${money(s)}`);
+      const alvo = await findById(targetId);
+      if (!alvo) {
+        await bot.sendMessage(chatId, `❌ Lançamento #${targetId} não encontrado.`);
         return;
       }
 
-      if (t === 'ultimos' || t === 'últimos') {
-        const u = await ultimos();
-        if (!u.length) {
-          await bot.sendMessage(chatId, 'Nenhum lançamento encontrado.');
-          return;
-        }
-        const txt = u.map((x) => `#${x.id} ${x.categoria} • R$ ${money(x.valor)} • ${x.descricao}`).join('\n');
-        await bot.sendMessage(chatId, `🧾 Últimos lançamentos\n\n${txt}`);
+      await deleteRow(alvo.row);
+      await bot.sendMessage(chatId, `🗑️ Lançamento #${targetId} apagado.`);
+      return;
+    }
+
+    if (t === '/start' || t === 'start') {
+      await bot.sendMessage(chatId, [
+        'FinLeo PRO ativo 🚀',
+        '',
+        'Comandos:',
+        '• saldo',
+        '• resumo',
+        '• resumo mercado',
+        '• mes passado',
+        '• resumo janeiro',
+        '• ultimos',
+        '• editar 12 valor 120',
+        '• editar 12 categoria transporte',
+        '• apagar 12',
+        '• meta mercado 800',
+        '• metas',
+        '',
+        'Todo lançamento novo volta com o ID.'
+      ].join('\n'));
+      return;
+    }
+
+    if (t === 'saldo') {
+      const s = await saldo();
+      await bot.sendMessage(chatId, `💰 R$ ${money(s)}`);
+      return;
+    }
+
+    if (t === 'ultimos' || t === 'últimos') {
+      const u = await ultimos();
+      if (!u.length) {
+        await bot.sendMessage(chatId, 'Nenhum lançamento encontrado.');
+        return;
+      }
+      const txt = u.map((x) => `#${x.id} ${x.categoria} • R$ ${money(x.valor)} • ${x.descricao}`).join('\n');
+      await bot.sendMessage(chatId, `🧾 Últimos lançamentos\n\n${txt}`);
+      return;
+    }
+
+    if (t === 'metas') {
+      const status = await metasStatus();
+      if (!status.length) {
+        await bot.sendMessage(chatId, 'Nenhuma meta cadastrada.');
+        return;
+      }
+      const txt = status.map(m => `• ${m.categoria}: R$ ${money(m.gasto)} / R$ ${money(m.meta)} (${m.percentual.toFixed(0)}%)`).join('\n');
+      await bot.sendMessage(chatId, `🎯 Metas do mês\n\n${txt}`);
+      return;
+    }
+
+    if (t.startsWith('meta ')) {
+      const match = t.match(/^meta\s+(.+?)\s+(\d+[.,]?\d*)$/);
+      if (!match) {
+        await bot.sendMessage(chatId, 'Use: meta mercado 800');
+        return;
+      }
+      const categoria = normalizeCategory(match[1]);
+      const valor = Number(match[2].replace(',', '.'));
+      await setMeta(categoria, valor);
+      await bot.sendMessage(chatId, `🎯 Meta salva\n${categoria}: R$ ${money(valor)}`);
+      return;
+    }
+
+    if (t === 'mes passado' || t === 'mês passado') {
+      await bot.sendMessage(chatId, await resumoMensal(null, parseMonthRef(t)));
+      return;
+    }
+
+    if (t === 'resumo') {
+      await bot.sendMessage(chatId, await resumoMensal());
+      return;
+    }
+
+    if (t.startsWith('resumo ')) {
+      const refDate = parseMonthRef(t);
+      const monthWords = ['janeiro','fevereiro','marco','março','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro','mes passado','mês passado'];
+      const categoria = monthWords.some(w => t.includes(w)) ? null : t.replace('resumo ', '').trim();
+      await bot.sendMessage(chatId, await resumoMensal(categoria, refDate));
+      return;
+    }
+
+    if (t.startsWith('apagar ')) {
+      const match = t.match(/\d+/);
+      const id = match ? Number(match[0]) : null;
+      if (!id) {
+        await bot.sendMessage(chatId, 'Use: apagar 12');
+        return;
+      }
+      const alvo = await findById(id);
+      if (!alvo) {
+        await bot.sendMessage(chatId, `❌ Lançamento #${id} não encontrado.`);
+        return;
+      }
+      pendingDelete.set(chatId, id);
+      await bot.sendMessage(chatId, `⚠️ Confirma apagar o lançamento #${id}? Responda: sim ou não`);
+      return;
+    }
+
+    if (t.startsWith('editar ')) {
+      const idMatch = t.match(/^editar\s+(\d+)/);
+      if (!idMatch) {
+        await bot.sendMessage(chatId, 'Use: editar 12 valor 120 ou editar 12 categoria transporte');
         return;
       }
 
-      if (t === 'hoje') {
-        await bot.sendMessage(chatId, await resumoHoje());
+      const id = Number(idMatch[1]);
+      const alvo = await findById(id);
+      if (!alvo) {
+        await bot.sendMessage(chatId, `❌ Lançamento #${id} não encontrado.`);
         return;
       }
 
-      if (t === 'resumo') {
-        await bot.sendMessage(chatId, await resumoMensal());
-        return;
-      }
-
-      if (t.startsWith('resumo ')) {
-        const categoria = t.replace('resumo ', '').trim();
-        await bot.sendMessage(chatId, await resumoMensal(categoria));
-        return;
-      }
-
-      if (t === 'apagar' || t === 'apagar ultimo' || t === 'apagar último') {
-        const u = await ultimos(1);
-        if (!u.length) {
-          await bot.sendMessage(chatId, 'Nenhum lançamento para apagar.');
-          return;
-        }
-        await deleteRow(u[0].row);
-        await bot.sendMessage(chatId, `🗑️ Lançamento #${u[0].id} apagado.`);
-        return;
-      }
-
-      if (t.startsWith('editar valor')) {
-        const match = t.match(/\d+[.,]?\d*/);
-        const novoValor = match ? Number(match[0].replace(',', '.')) : null;
-
+      if (t.includes(' valor ')) {
+        const valueMatch = t.match(/\d+[.,]?\d*$/);
+        const novoValor = valueMatch ? Number(valueMatch[0].replace(',', '.')) : null;
         if (!novoValor) {
-          await bot.sendMessage(chatId, 'Use: editar valor 120');
+          await bot.sendMessage(chatId, 'Use: editar 12 valor 120');
           return;
         }
-
-        const u = await ultimos(1);
-        if (!u.length) {
-          await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
-          return;
-        }
-
-        await updateCell(u[0].row, 'D', novoValor);
-        await bot.sendMessage(chatId, `✏️ Valor do lançamento #${u[0].id} atualizado para R$ ${money(novoValor)}.`);
+        await updateCell(alvo.row, 'D', novoValor);
+        await bot.sendMessage(chatId, `✏️ Lançamento #${id} atualizado.\nNovo valor: R$ ${money(novoValor)}`);
         return;
       }
 
-      if (t.startsWith('editar categoria')) {
-        const categoria = t.replace('editar categoria', '').trim();
-
-        if (!categoria) {
-          await bot.sendMessage(chatId, 'Use: editar categoria transporte');
+      if (t.includes(' categoria ')) {
+        const novaCategoria = t.split(' categoria ')[1]?.trim();
+        if (!novaCategoria) {
+          await bot.sendMessage(chatId, 'Use: editar 12 categoria transporte');
           return;
         }
-
-        const u = await ultimos(1);
-        if (!u.length) {
-          await bot.sendMessage(chatId, 'Nenhum lançamento para editar.');
-          return;
-        }
-
-        await updateCell(u[0].row, 'E', categoria);
-        await bot.sendMessage(chatId, `✏️ Categoria do lançamento #${u[0].id} atualizada para ${categoria}.`);
+        await updateCell(alvo.row, 'E', normalizeCategory(novaCategoria));
+        await bot.sendMessage(chatId, `✏️ Lançamento #${id} atualizado.\nNova categoria: ${normalizeCategory(novaCategoria)}`);
         return;
       }
 
-      const tentativaRegra = interpretarRegra(msg.text);
-
-      if (tentativaRegra) {
-        await add(tentativaRegra.tipo, tentativaRegra.valor, tentativaRegra.categoria || 'geral', msg.text, usuario);
-        const s = await saldo();
-        await bot.sendMessage(
-          chatId,
-          `✔️ R$ ${money(tentativaRegra.valor)} (${tentativaRegra.categoria})\nSaldo: R$ ${money(s)}`
-        );
-        return;
-      }
-
-      const dados = await interpretar(msg.text);
-
-      if (dados.eh && dados.valor) {
-        await add(dados.tipo, dados.valor, dados.categoria || 'geral', msg.text, usuario);
-        const s = await saldo();
-        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
-        return;
-      }
-
-      await bot.sendMessage(chatId, 'Não entendi');
+      await bot.sendMessage(chatId, 'Use: editar 12 valor 120 ou editar 12 categoria transporte');
       return;
     }
 
-    if (msg.voice) {
-      const filePath = '/tmp/telegram_voice.ogg';
-      await baixarArquivoTelegram(msg.voice.file_id, filePath);
-
-      const dados = await interpretarArquivoComGemini(
-        filePath,
-        'audio/ogg',
-        `Transcreva e interprete este áudio em português.
-Responda apenas JSON válido com:
-{
-  "eh": true,
-  "tipo": "gasto|receita|null",
-  "valor": number|null,
-  "categoria": "string|null",
-  "texto_transcrito": "string|null"
-}
-Se não for um lançamento financeiro, responda:
-{"eh": false, "tipo": null, "valor": null, "categoria": null, "texto_transcrito": "texto" }`
-      );
-
-      if (dados.texto_transcrito) {
-        await bot.sendMessage(chatId, `🎤 Entendi: "${dados.texto_transcrito}"`);
+    const tentativaRegra = interpretarRegra(msg.text);
+    if (tentativaRegra) {
+      const newId = await add(tentativaRegra.tipo, tentativaRegra.valor, tentativaRegra.categoria || 'geral', msg.text, usuario);
+      const s = await saldo();
+      let resposta = `✔️ Lançamento #${newId} registrado\nR$ ${money(tentativaRegra.valor)} (${tentativaRegra.categoria})\nSaldo: R$ ${money(s)}`;
+      if (tentativaRegra.tipo === 'gasto') {
+        const alerta = await checkMetaAlert(tentativaRegra.categoria);
+        if (alerta) resposta += `\n\n${alerta}`;
       }
-
-      if (dados.eh && dados.valor) {
-        await add(dados.tipo, dados.valor, dados.categoria || 'geral', dados.texto_transcrito || 'áudio', usuario);
-        const s = await saldo();
-        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
-        return;
-      }
-
-      await bot.sendMessage(chatId, 'Não consegui identificar um lançamento nesse áudio.');
+      await bot.sendMessage(chatId, resposta);
       return;
     }
 
-    if (msg.photo && msg.photo.length > 0) {
-      const maior = msg.photo[msg.photo.length - 1];
-      const filePath = '/tmp/telegram_photo.jpg';
-      await baixarArquivoTelegram(maior.file_id, filePath);
-
-      const dados = await interpretarArquivoComGemini(
-        filePath,
-        'image/jpeg',
-        `Analise esta imagem de recibo, nota, comprovante ou foto relacionada a gasto.
-Responda apenas JSON válido com:
-{
-  "eh": true,
-  "tipo": "gasto|receita|null",
-  "valor": number|null,
-  "categoria": "string|null",
-  "descricao": "string|null"
-}
-Se não houver lançamento identificável, responda:
-{"eh": false, "tipo": null, "valor": null, "categoria": null, "descricao": null}`
-      );
-
-      if (dados.eh && dados.valor) {
-        await add(dados.tipo, dados.valor, dados.categoria || 'geral', dados.descricao || 'imagem', usuario);
-        const s = await saldo();
-        await bot.sendMessage(chatId, `✔️ R$ ${money(dados.valor)} (${dados.categoria})\nSaldo: R$ ${money(s)}`);
-        return;
+    const dados = await interpretar(msg.text);
+    if (dados.eh && dados.valor) {
+      const cat = normalizeCategory(dados.categoria || 'geral');
+      const newId = await add(dados.tipo, dados.valor, cat, msg.text, usuario);
+      const s = await saldo();
+      let resposta = `✔️ Lançamento #${newId} registrado\nR$ ${money(dados.valor)} (${cat})\nSaldo: R$ ${money(s)}`;
+      if (dados.tipo === 'gasto') {
+        const alerta = await checkMetaAlert(cat);
+        if (alerta) resposta += `\n\n${alerta}`;
       }
-
-      await bot.sendMessage(chatId, 'Não consegui identificar um lançamento nessa imagem.');
+      await bot.sendMessage(chatId, resposta);
       return;
     }
 
-    await bot.sendMessage(chatId, 'Envie texto, áudio ou imagem.');
+    await bot.sendMessage(chatId, 'Não entendi');
   } catch (e) {
     console.error('ERRO COMPLETO:', e);
-
     const mensagem = String(e?.message || '');
-
-    if (
-      e?.status === 503 ||
-      mensagem.includes('high demand') ||
-      mensagem.includes('UNAVAILABLE')
-    ) {
+    if (e?.status === 503 || mensagem.includes('high demand') || mensagem.includes('UNAVAILABLE')) {
       await bot.sendMessage(chatId, '⚠️ O Gemini está com alta demanda agora. Tente novamente em alguns segundos.');
       return;
     }
-
-    const erroMsg =
-      e?.message ||
-      e?.response?.data?.error?.message ||
-      'Erro interno';
-
-    await bot.sendMessage(chatId, `❌ ${erroMsg}`);
+    const msgErro = e?.message || e?.response?.data?.error?.message || 'Erro interno';
+    await bot.sendMessage(chatId, `❌ ${msgErro}`);
   }
 });
 
